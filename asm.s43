@@ -1,0 +1,891 @@
+#include "msp430.h"                     ; #define controlled include file
+
+        NAME    main                    ; module name
+
+        PUBLIC  main                    ; make the main label visible
+                                        ; outside this module
+        ORG     0FFFEh
+        DC16    init                    ; set reset vector to 'init' label
+        ORG     0x01c00
+       
+; High Bytes and Low bytes for Numbers
+;                      0     1     2     3     4     5     6     7     8     9
+numberHighBytes  db  11111100B, 01100000B, 11011011B, 11110001B, 01100111B, 10110111B, 10111111B, 11100000B, 11111111B, 11110111B 
+numberLowBytes   db  00101000B, 0, 0, 0, 0, 0, 0, 0, 0, 0
+; High Byte and Low Bytes for Operators
+;                       +          -          /          *
+operatorHighBytes db 00000011B, 00000011B, 00000000B, 00000011B
+operatorLowBytes  db 01010000B, 00000000B, 00101000B, 11111010B
+
+; Position map of LCD to memory addresses
+;                        0       1       2       3       4       5
+positionHighBytes dw  0x0A29, 0x0A25, 0x0A23, 0x0A32, 0x0A2E, 0x0A27
+positionLowBytes  dw  0x0A2A, 0x0A26, 0x0A24, 0x0A33, 0x0A2F, 0x0A28
+
+
+; Global Variables
+num1      dw 0     ; stores first number
+num2      dw 0     ; stores second number
+op        db 0     ; stores operator
+          ALIGN 1
+result    dw 0,0   ; stores operation result
+
+state     db 0     ; stores the current state
+curDigit  db 0     ; stores the current digit
+position  db 0     ; stores the current position
+negFlag   db 0     ; if result is positive negFlag is 0, if negative negFlag is 1
+
+        RSEG    CSTACK                  ; pre-declaration of segment
+        RSEG    CODE                    ; place program in 'CODE' segment
+
+init:   MOV   #SFE(CSTACK), SP          ; set up stack
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;Objetivo: Preparar el LCD para obtener valores.
+;Precondiciones: El LCD esta apagado.
+;Postcondiciones: El LCD esta encendido y listo para obtener valores.
+;Autor: Kevin Lugo
+;Fecha: 3/12/2021
+
+SetupLCD:
+        mov.w #0xffff, &LCDCPCTL0
+        mov.w #0xfc3f, &LCDCPCTL1
+        mov.w #0x0fff, &LCDCPCTL2
+        
+        mov #0x041e, &LCDCCTL0
+        mov #0x0208, &LCDCVCTL
+        mov #0x8000, &LCDCCPCTL
+        
+        bis #1, &LCDCCTL0    ;Turn LCD ON
+
+;Objetivo: Preparar los botones para ser utilizados como input.
+;Precondiciones: Los botones no están en uso.
+;Postcondiciones: Los botones están listos para ser utilizados como input.
+;Autor: José Navarro Figueroa
+;Fecha: 2/11/2021
+
+SetupPins:
+        bic.b   #0xFF, &P1SEL0
+        bic.b   #0xFF, &P1SEL1
+        
+        bic.b   #0xFF, &P9SEL0
+        bic.b   #0xFF, &P9SEL1
+   
+        mov.b   #11111001B,&P1DIR
+        bis.b   #0xFF, &P9DIR
+        
+        mov.b   #00000110B,&P1REN
+        bis.b   #00000110B,&P1OUT
+
+;Objetivo: Habilitar GPIO y hacer "clear" al display.
+;Precondiciones: GPIO está bloqueado y el LCD posiblemente tiene contentido.
+;Postcondiciones: GPIO está desbloqueado y el LCD está vacío.
+;Autor: José Navarro Figueroa, Kevin Lugo
+;Fecha: 2/11/2021, 3/12/2021
+
+UnlockGPIO:
+        bic.w   #LOCKLPM5, &PM5CTL0
+        call    #clearDisplay
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;Objetivo: Llamar las subrutinas para monitorear si se presionan los botones.
+;Precondiciones: El MSP430 está encendido.
+;Postcondiciones: El MSP430 está encendido y monitoreando los botones.
+;Autor: Kevin Lugo
+;Fecha: 3/12/2021
+
+main:   NOP                             ; main program
+        mov.w   #WDTPW+WDTHOLD,&WDTCTL  ; Stop watchdog timer
+        
+        call    #initState
+        call    #buttonLeft
+        call    #buttonRight
+        
+        call    #delay
+
+        JMP     main
+        
+;Objetivo: Hacer un "reset" si el programa está en un estado inicial.
+;Precondiciones: El programa acaba de comenzar.
+;Postcondiciones: El MSP430 está encendido y listo para el primer dígito.
+;Autor: Yavier Mari
+;Fecha: 3/15/2021
+
+initState: ; Check if the application is in the first state
+        cmp     #0, state
+        jeq     restart
+        ret
+
+;Objetivo: Hacer un "reset" de todas las variables que utilizamos para el display.
+;Precondiciones: El programa acaba de comenzar o acaba de culminar una operación.
+;Postcondiciones: El MSP430 está listo para hacer una nueva operación y todas las variables globales se inicializan.
+;Autor: Yavier Mari
+;Fecha: 3/15/2021
+
+restart: ; Reset Global Variables
+        push    R5
+        call    #clearDisplay
+        
+        mov.b   #0, curDigit ; set Current Digit to 0
+        mov     #0, num1     ; set number 1 to 0
+        mov     #0, num2     ; set Number 2 to 0
+        mov.b   #0, op       ;set the Operand to + 
+        mov.b   #1, state    ;set state to 1
+        mov.b   #0, position ;set position 1
+        mov.b   #0, negFlag
+
+        mov     #result, R5 ;R5 is now a pointer to the Result list of 2 words
+        mov     #0, 0(R5)  ; setting the first word to 0
+        mov     #0, 2(R5)  ; setting the second word to 0
+        
+        call    #genNumber
+        pop     R5
+        ret
+
+;Objetivo: Detectar si el botón izquierdo fue presionado.
+;Precondiciones: El botón izquierdo fue presionado.
+;Postcondiciones: El programa lleva a cabo otra función dado a que el botón fue presionado.
+;Autor: José Navarro Figueroa
+;Fecha: 2/11/2021
+
+buttonLeft: ; Left button assignment
+        mov.b   &P1IN, R5
+        and.b   #00000110B, R5
+        cmp.b   #00000100B, R5
+        jeq     pressLeft
+        ret
+
+;Objetivo: Colocar números en el display.
+;Precondiciones: El botón izquierdo fue presionado.
+;Postcondiciones: El programa comienza a contar del 0 al 9 y lo coloca en el display.
+;Autor: Yavier Mari, Kevin Lugo
+;Fecha: 3/14/2021
+
+pressLeft: ; Left button pressed
+        call    #digitCycle
+        call    #genNumber
+        ret
+
+;Objetivo: Detectar si el botón derecho fue presionado.
+;Precondiciones: El botón derecho fue presionado.
+;Postcondiciones: El programa lleva a cabo otra función dado a que el botón fue presionado.
+;Autor: José Navarro Figueroa
+;Fecha: 2/11/2021
+
+buttonRight: ; Right button assignment
+        mov.b   &P1IN, R5
+        and.b   #00000110B, R5
+        cmp.b   #00000010B, R5
+        jeq     pressRight
+        ret
+
+;Objetivo: Continuar al próximo dígito, a la selección de operando, o al resultado de una operación, dependiento del estado actual del programa.
+;Precondiciones: El botón derecho fue presionado.
+;Postcondiciones: El programa continua al próximo dígito, a la selección de operando, o al resultado de una operación, dependiento del estado actual del programa.
+;Autor: Yavier Mari, Kevin Lugo
+;Fecha: 3/14/2021
+
+pressRight: ; Right button pressed
+        call    #stateCheck
+        ret
+        
+;Objetivo: Verificar en qué estado estamos para saber si se cambiará el próximo dígito, se pasará a la selección de una operación, o al resultado de una operación.
+;Precondiciones: El botón derecho fue presionado.
+;Postcondiciones: El programa continua al próximo dígito, a la selección de operando, o al resultado de una operación, dependiento del estado actual del programa.
+;Autor: Yavier Mari, Kevin Lugo
+;Fecha: 3/14/2021
+
+stateCheck: ; Checks for the current state, then modifies the position
+        call    #ModifyDigits
+        cmp.b   #4, position ; Check if the the program is currently in the 3rd position if it is increment the state. 
+        jeq     stateCycle
+        cmp.b   #2, state
+        jeq     stateCycleOp
+        cmp.b   #4, state
+        jeq     restart
+       
+        call    #positionCycle
+        ret
+
+;Objetivo: Determinar qué número se está moficando (entiéndase, el primero o segundo número a ser utilizado en la operación matemática)
+;Precondiciones: Hay un número en la pantalla.
+;Postcondiciones: El número en la pantalla es convertido a un número que se puede utilizar en las operaciones.
+;Autor: Yavier Mari, Kevin Lugo
+;Fecha: 3/16/2021
+
+ModifyDigits:
+        cmp.b   #1, state               
+        jeq     ModifyDigit1    ;Modify num1
+        
+        cmp.b   #3, state
+        jeq     ModifyDigit2 ; Modify num2
+        RET
+
+;Objetivo: Convertir el primer número que se utilizará en la operación matemática a un número decimal.
+;Precondiciones: Hay un número en la pantalla.
+;Postcondiciones: El número en la pantalla es convertido a un número que se puede utilizar en las operaciones.
+;Autor: Yavier Mari, Kevin Lugo
+;Fecha: 3/16/2021
+
+ModifyDigit1:
+        push    R5
+        push    R6
+        push    R7
+        push    R8
+        
+        mov.b   curDigit, R5    ;new Digit to Add
+        mov     num1, R6        ;Operand 1
+        mov.b   #0, R7          ;index
+        mov     #0, R8          ;result
+        call    #MultByTen
+        
+        add     R5, R8
+        
+        mov     R8, num1
+        
+        pop     R8
+        pop     R7
+        pop     R6
+        pop     R5
+        
+        RET
+
+;Objetivo: Convertir el segundo número que se utilizará en la operación matemática a un número decimal.
+;Precondiciones: Hay un número en la pantalla.
+;Postcondiciones: El número en la pantalla es convertido a un número que se puede utilizar en las operaciones.
+;Autor: Yavier Mari, Kevin Lugo
+;Fecha: 3/16/2021
+        
+ModifyDigit2:
+        push    R5
+        push    R6
+        push    R7
+        push    R8
+        
+        mov.b   curDigit, R5    ;new Digit to Add
+        mov     num2, R6        ;Operand 2
+        mov.b   #0, R7          ;index
+        mov     #0, R8          ;result
+        call    #MultByTen
+        
+        add     R5, R8
+        
+        mov     R8, num2
+        
+        pop     R8
+        pop     R7
+        pop     R6
+        pop     R5
+        
+        RET
+        
+;Objetivo: Multiplicar un número por 10.
+;Precondiciones: Tener un número.
+;Postcondiciones: El número que tenías se multiplicó por 10.
+;Autor: Yavier Mari, Kevin Lugo
+;Fecha: 3/16/2021
+        
+MultByTen:
+        cmp.b   #10, R7
+        jeq     EndLoop
+        add     R6, R8
+        inc.b   R7
+        jmp     MultByTen      
+
+;Objetivo: Return.
+;Precondiciones: Haber terminado
+;Postcondiciones: Retornas al lugar donde empezaste.
+;Autor: Yavier Mari, Kevin Lugo
+;Fecha: 3/16/2021
+
+EndLoop:
+        ret   
+
+;Objetivo: Cambiar de estados de dígitos a estado de operador o de resultado.
+;Precondiciones: El botón derecho fue presionado.
+;Postcondiciones: El programa cambia al estado pertinente.
+;Autor: Yavier Mari, Kevin Lugo
+;Fecha: 3/14/2021 - 3/16/2021
+        
+stateCycle: ; Cycles the state to the next iteration
+        inc.b   state
+        mov.b   #0, position
+        jmp     stateClear
+
+;Objetivo: Cambiar de operador a próximo dígito o resultado.
+;Precondiciones: El botón derecho fue presionado.
+;Postcondiciones: El programa cambia al estado pertinente.
+;Autor: Yavier Mari, Kevin Lugo
+;Fecha: 3/14/2021 - 3/16/2021
+
+stateCycleOp: ; Cycles the state to the next iteration and stores the operator
+        mov.b   curDigit, op
+        inc.b   state
+        mov.b   #0, position
+        
+;Objetivo: Prueba si estamos en el ultimo estado para retornar el resultado.
+;Precondiciones: El botón derecho fue presionado.
+;Postcondiciones: El programa cambia al estado pertinente.
+;Autor: Yavier Mari, Kevin Lugo
+;Fecha: 3/14/2021 - 3/16/2021
+
+stateClear: ; Tests for the final state, returns the result
+        cmp.b   #4, state
+        jeq     stateResult
+        call    #clearDisplay
+        mov.b   #0, curDigit
+        call    #genNumber
+        
+        ret
+
+;Objetivo: Calcular el resultado.
+;Precondiciones: Tener dos números y una operación.
+;Postcondiciones: Tener el resultado.
+;Autor: Yavier Mari, Kevin Lugo
+;Fecha: 3/14/2021 - 3/16/2021
+
+stateResult: ; Computes the result and returns it       
+        call    #ExecuteOperations       
+        call    #displayResult
+
+        mov.b   #0, position
+        ret
+        
+;Objetivo: Presentar el resultado en la pantalla.
+;Precondiciones: Tener el resultado de una operación.
+;Postcondiciones: Presenta el resultado en la pantalla.
+;Autor: Yavier Mari, Kevin Lugo
+;Fecha: 3/14/2021 - 3/17/2021
+
+displayResult:
+        Push    R5
+        Push    R6
+        Push    R7
+        push    R8
+        Push    R9
+        Push    R10
+        Push    R11
+        push    R12
+        
+        call    #clearDisplay        
+        call    #TurnOnNegative        
+        
+        mov     #result, R5        
+        
+        mov     2(R5), R6 ; X
+        mov     0(R5), R5 
+        
+        mov     R6, R9
+        mov     R5, R12
+        mov.b   #10, R7   ; position, must start in 10   
+       
+        jmp     displayNormalResult
+
+;Objetivo: Probar si el numero es negativo.
+;Precondiciones: Se realizaron las operaciones.
+;Postcondiciones: Si es negativo, prende el segmento de negativo en el LCD. Si es positivo, ignora esta subrutina.
+;Autor: Yavier Mari, Kevin Lugo
+;Fecha: 3/14/2021 - 3/16/2021
+
+TurnOnNegative:
+        cmp.b   #1, negFlag
+        jeq     TurnOn
+        ret
+        
+TurnOn:
+        mov.b   #0x04,&0xA2A
+        ret
+      
+;Objetivo: Eliminar los datos de todos los registros.
+;Precondiciones: Los registros posiblemente tienen datos.
+;Postcondiciones: Los registros no tienen datos.
+;Autor: Yavier Mari, Kevin Lugo
+;Fecha: 3/14/2021 - 3/16/2021
+
+fin:
+        
+        pop     R12
+        pop     R11
+        pop     R10
+        pop     R9
+        pop     R8
+        pop     R7
+        pop     R6
+        pop     R5
+    
+        ret
+
+;Objetivo: Presentar un resultado normal en la pantalla
+;Precondiciones: Tener un resultado para presentar.
+;Postcondiciones: El resultado se presenta en la pantalla.
+;Autor: Yavier Mari, Kevin Lugo
+;Fecha: 3/14/2021 - 3/17/2021
+
+displayNormalResult:
+        ;R9 = X, N = 10
+        ;passed in R12:R9 , R10 = Mod Result, R13:R11 == result of Division
+        call    #modDiv
+        
+        mov     R13, R12
+        mov     R11, R9 ; X = X/10
+        
+        mov.b   R10, curDigit ; currDigit = X % 10
+        mov.b   R7, position
+        call    #genNumber
+        
+        decd.b  R7   
+
+        tst     R9  ;if X is 0
+        jeq     fin
+        jmp     displayNormalResult
+         
+;Objetivo: Encontrar el modulo (remainder) de una división.
+;Precondiciones: Tener un resultado para presentar.
+;Postcondiciones: El resultado se presenta en la pantalla.
+;Autor: Yavier Mari, Kevin Lugo
+;Fecha: 3/14/2021 - 3/17/2021
+
+modDiv: ; Divides both numbers  
+        ;R12:R9 --> R8:R10
+        mov     R12, R8
+        mov     R9, R10 ; assign remainder to R10
+             
+        mov     #0, R13
+        mov     #0, R11 ;quotient result = R13:R11
+        
+modDivPositiveCheck:
+        cmp     #0, R8
+        jnz     modDivHelper
+        cmp     #0, R10
+        jz      modDivResult
+        bit     #0x8000, R10
+        jnz     modDivHelper
+        cmp     #10, R10          ; num1 - num2
+        jn      modDivResult
+
+;Objetivo: Ayudar a encontrar el modulo (remainder) de una división.
+;Precondiciones: Tener un resultado para presentar.
+;Postcondiciones: El resultado se presenta en la pantalla.
+;Autor: Yavier Mari, Kevin Lugo
+;Fecha: 3/14/2021 - 3/17/2021
+
+modDivHelper: ; Divide helper method, keeps subtracting
+        sub     #10, R10          ; num1 <- num1 - num2
+        sbc     R8
+        inc     R11               ; increase quotient value
+        adc     R13
+        jmp     modDivPositiveCheck
+
+;Objetivo: Devolver el resultado de división.
+;Precondiciones: Tener un resultado para presentar.
+;Postcondiciones: El resultado se presenta en la pantalla.
+;Autor: Yavier Mari, Kevin Lugo
+;Fecha: 3/14/2021 - 3/17/2021
+
+modDivResult: ; Return the division result
+        ret
+
+;Objetivo: Compara el operador seleccionado y realiza la operacion necesaria.
+;Precondiciones: Estar en el ultimo estado
+;Postcondiciones: Calcula el resultado final.
+;Autor: Yavier, Kevin Lugo
+;Fecha: 3/14/2021
+
+ExecuteOperations:
+        cmp     #0, op
+        jeq     sum
+        cmp     #1, op
+        jeq     substract
+        cmp     #2, op
+        jeq     divide
+        cmp     #3, op
+        jeq     multiply
+
+;Objetivo: Itera por las posiciones del LCD display.
+;Precondiciones: Querer moverse de posicion.
+;Postcondiciones: Posicion se incremento.
+;Autor: Kevin Lugo
+;Fecha: 3/14/2021 - 3/17/2021
+
+positionCycle: ; Cycles the position  to the next iteration
+        incd    position ; Incrementing the Position by 2
+        mov.b   #0, curDigit
+        call    #genNumber
+        
+        ret
+
+;Objetivo: Iterar el digito actual desde 0 a 9.
+;Precondiciones: Querer iterar entre digitos u operadores y estar en estados #1 o #3.
+;Postcondiciones: El digito cambio de forma circular entre 0-9.
+;Autor: Kevin Lugo
+;Fecha: 3/14/2021 - 3/17/2021
+
+digitCycle: ; Cycles the current digit from 0-9, else operator cycle
+        push    R5
+        
+        mov.b   curDigit, R5
+        cmp.b   #2, state
+        jeq     operatorCycle
+        cmp.b   #9, R5
+        jeq     resetDigit
+        inc.b   R5
+
+;Objetivo: Selecciona el digito y/u operador que se quiere obtener.
+;Precondiciones: Estar en el digito/operador y presionar el boton derecho.
+;Postcondiciones: Se selecciono el digito/operador.
+;Autor: Kevin Lugo
+;Fecha: 3/14/2021 - 3/17/2021
+
+reset: ; Updates the current digit or operator
+        mov.b   R5, curDigit
+        pop     R5
+        ret
+
+;Objetivo: Modificar el digito/operador a posicion 0.
+;Precondiciones: Estar en la ultima posicion del digito/operador y presionar el boton izquierdo.
+;Postcondiciones: El digito se movio a la posicion 0, conviertiendolo en decimal "0" y/o "+".
+;Autor: Kevin Lugo
+;Fecha: 3/14/2021 - 3/17/2021
+
+resetDigit: ; Sets the current digit to 0
+        mov     #0, R5
+        jmp     reset
+
+;Objetivo: Iterar entre las operaciones.
+;Precondiciones: Estar en estado #2 y presionar el boton izquierdo.
+;Postcondiciones: El digito cambia de forma circular entre +, -, /, *.
+;Autor: Kevin Lugo
+;Fecha: 3/14/2021 - 3/17/2021
+
+operatorCycle: ; Cycles the operator between +, -, /, *
+        cmp.b   #3, R5
+        jeq     resetDigit
+        inc.b   R5
+        jmp     reset        
+
+;Objetivo: Generar el digito en el LCD display.
+;Precondiciones: Estar en estado #1 o #3 y haber seleccionado un digito.
+;Postcondiciones: Genera el digito en el LCD display.
+;Autor: Yavier Mari, Kevin Lugo
+;Fecha: 3/14/2021 - 3/17/2021
+
+genNumber: ; Assigns number and position to display
+        cmp.b   #2, state
+        jeq     genOperator
+        
+        push    R5
+        push    R6
+        
+        CALL    #displayNumber
+        
+        pop     R6
+        pop     R5
+        ret
+
+;Objetivo: Generar el operador en el LCD display.
+;Precondiciones: Estar en estado #2 y haber seleccionado un operador.
+;Postcondiciones: Genera el operador en el LCD display.
+;Autor: Yavier Mari, Kevin Lugo
+;Fecha: 3/14/2021 - 3/17/2021
+
+genOperator: ; Assigns the operator and position to display
+        mov.b   curDigit, R5
+        call    #displayOperator
+        ret
+
+;Objetivo: Muestra el digito en el LCD display.
+;Precondiciones: Llamar genNumber (generar el numero).
+;Postcondiciones: Muestra el digito en el LCD display.
+;Autor: Yavier Mari, Kevin Lugo
+;Fecha: 3/14/2021 - 3/17/2021
+
+displayNumber:
+        push.b  R5
+        push.b  R6
+        push.b  R7
+        
+        mov.b   position, R5
+        mov.b   curDigit, R7 ;selection the position in the LCD
+        mov     positionHighBytes(R5), R6 ; make r6 a pointer         
+        mov.b   numberHighBytes(R7), 0(R6) ; access value in memory R6 position is always 0        
+        mov     positionLowBytes(R5), R6 ; repeat with the lowBytes        
+        mov.b   numberLowBytes(R7), 0(R6)
+        
+        pop     R7
+        pop     R6
+        pop     R5        
+        ret
+
+;Objetivo: Muestra el operador en el LCD display.
+;Precondiciones: Llamar genOperator (generar el operador).
+;Postcondiciones: Muestra el operador en el LCD display.
+;Autor: Yavier Mari, Kevin Lugo
+;Fecha: 3/14/2021 - 3/17/2021
+
+displayOperator: ; Displays the current operator
+        push    R6
+        
+        mov     #positionHighBytes, R6
+        mov     0(R6), R6        
+        mov.b   operatorHighBytes(R5), 0(R6)
+        mov     #positionLowBytes, R6
+        mov     0(R6), R6 
+        mov.b   operatorLowBytes(R5), 0(R6)
+        
+        pop     R6
+        ret
+
+;Objetivo: Apagar todos los segmentos de LCD display.
+;Precondiciones: N/A.
+;Postcondiciones: El LCD display esta apagado.
+;Autor: Yavier Mari, Kevin Lugo
+;Fecha: 3/14/2021 - 3/17/2021
+
+clearDisplay: ; Clears the LCD display
+        mov     #2, &LCDCMEMCTL
+        ret
+
+;Objetivo: Crear un delay en los inputs.
+;Precondiciones: N/A.
+;Postcondiciones: Crea un delay en el programa, haciendo que se tarde mas en tomar inputs para mejor navegacion.
+;Autor: Yavier Mari, Kevin Lugo
+;Fecha: 3/14/2021 - 3/17/2021
+
+delay: ; Delays the input detection
+        mov     #0xFFFF, R15
+
+decDelay: ; Decreases the delay variable
+        dec     R15
+        jnz     decDelay
+        ret
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;Objetivo: Sumar dos numeros.
+;Precondiciones: Tener dos numeros y el operando +.
+;Postcondiciones: Retorna la suma de dos numeros en la variable "result".
+;Autor: Yavier Mari
+;Fecha: 3/14/2021 - 3/17/2021
+
+sum: ; Sums both numbers
+        push    R5
+        push    R6
+        
+        mov     #result, R6
+        mov     num1, R5       
+        add     num2, R5
+        mov     R5, 2(R6)
+        
+        pop     R6
+        pop     R5
+        ret
+
+;Objetivo: Resta dos numeros.
+;Precondiciones: Tener dos numeros y el operando -.
+;Postcondiciones: Retorna la resta de dos numeros en la variable "result".
+;Autor: Kevin Lugo
+;Fecha: 3/14/2021 - 3/17/2021
+
+substract: ; Substracts both numbers
+        push    R5
+        push    R6
+        push    R7
+
+        mov     num1, R5; A
+        mov     num2, R6; B
+
+        cmp     R6, R5 ; R5 - R6 
+        jl      specialSub; R6 > R5 == B > A
+
+        sub     R6, R5;   A <-   A - B
+
+        mov     #result, R7
+        mov     R5, 2(R7); Result = A <- A-B
+
+        pop     R7
+        pop     R6
+        pop     R5
+        ret
+
+;Objetivo: Resta dos numeros.
+;Precondiciones: Tener dos numeros, que el operando sea -, y que el segundo numero sea mayor.
+;Postcondiciones: Retorna la resta de dos numeros en la variable "result" y marca el negFlag como resultado negativo.
+;Autor: Kevin Lugo
+;Fecha: 3/14/2021 - 3/17/2021
+
+specialSub: ; Negative result substraction
+        sub     R5, R6 ; B <- B - A
+        mov     #result, R7
+        mov     R6, 2(R7); Result = A <- A-B
+        mov.b   #1, negFlag
+        
+        pop     R7
+        pop     R6
+        pop     R5
+        ret
+
+;Objetivo: Multiplica dos numeros.
+;Precondiciones: Tener dos numeros y el operando *.
+;Postcondiciones: Retorna la multiplicacion de dos numeros en la variable "result".
+;Autor: Yavier Mari, Jose Maldonado
+;Fecha: 3/14/2021 - 3/17/2021
+
+multiply: ; Multiplies both numbers
+        push    R5 ; counter
+        push    R6 ; result value
+        push    R7 ; smaller number
+        push    R8 ; bigger number
+        push    R9 ; result variable
+        push    R10; 32bit carry
+
+        mov     #0, R5
+        mov     #0, R6
+        mov     num2, R8
+        mov     num1, R7
+        mov     #0, R10
+        
+        cmp     #0, R7
+        jz      multiplyResult
+        cmp     #0, R8
+        jz      multiplyResult
+        cmp     R8, R7 ; num1 - num2, positive means num1 is bigger, negative means num2 is bigger
+        jz      num1Smaller ; same number, multiply normally
+        jn      num1Smaller ; R7 (num1) is smaller, multiply normally
+
+;Objetivo: Intercambia los numeros en los registros para una multiplicacion mas eficiente.
+;Precondiciones: Tener dos numeros, el operando * y que el segundo numero sea menos que el primero.
+;Postcondiciones: Intercambia los numeros de los registros.
+;Autor: Yavier Mari, Jose Maldonado
+;Fecha: 3/14/2021 - 3/17/2021
+
+num2Smaller: ; Swap numbers so that smaller is on R7
+        mov     num1, R8
+        mov     num2, R7
+
+;Objetivo: Compara el contador y el numero menos para saber si termino la multiplicacion.
+;Precondiciones: Tener dos numeros y querer seguir multiplicando.
+;Postcondiciones: El numero se termino de multiplicar.
+;Autor: Yavier Mari, Jose Maldonado
+;Fecha: 3/14/2021 - 3/17/2021
+
+num1Smaller: ; Continue multiplying
+        cmp     R5, R7  ; if this aint equal
+        jz      multiplyResult
+
+;Objetivo: Continua sumando hasta llegar a la multiplicacion deseada.
+;Precondiciones: Tener dos numeros y querer seguir multiplicando.
+;Postcondiciones: El numero se le sumo otra vez para continuar la multiplicacion.
+;Autor: Yavier Mari, Jose Maldonado
+;Fecha: 3/14/2021 - 3/17/2021
+
+multiplyHelper: ; Keeps adding to the result until mult. is done
+        inc     R5      ; increment counter
+        add     R8, R6  ; keep adding
+        jc      incCarry ; if result value is bigger than 16bits, counter
+        jmp     carrySkip ; continue multiplying if still in 16bits
+
+;Objetivo: Incrementar un contador para saber el valor de el resultado de 32bits en caso de serlo.
+;Precondiciones: La multiplicacion paso de 0xFFFF.
+;Postcondiciones: Subimos uno al contador.
+;Autor: Yavier Mari
+;Fecha: 3/14/2021 - 3/17/2021
+
+incCarry: ; Increase carry beyond 16bits
+        inc     R10
+
+;Objetivo: Continuar la multiplicacion.
+;Precondiciones: N/A.
+;Postcondiciones: Comparamos el resultado actual para saber si llegamos al resultado final.
+;Autor: Yavier Mari
+;Fecha: 3/14/2021 - 3/17/2021
+
+carrySkip: ; Continue multiplying
+        cmp     R5, R7
+        jne     multiplyHelper
+
+;Objetivo: Devuelve el resultado de la multiplicacion.
+;Precondiciones: Terminar la multiplicacion.
+;Postcondiciones: El resultado se guarda en la variable "result".
+;Autor: Yavier Mari, Kevin Lugo
+;Fecha: 3/14/2021 - 3/17/2021
+
+multiplyResult: ; Returns the multiplication result
+        mov     #result, R9
+        mov     R10, 0(R9)
+        mov     R6, 2(R9)
+
+        pop     R10
+        pop     R9
+        pop     R8
+        pop     R7
+        pop     R6
+        pop     R5
+
+        ret
+
+;Objetivo: Dividir dos numeros.
+;Precondiciones: Tener dos numeros y el operando /.
+;Postcondiciones: Retorna la division de dos numeros en la variable "result". Nota Aclaratoria: En caso de division entre 0 (no es posible), se retornara 0.
+;Autor: Yavier Mari
+;Fecha: 3/14/2021 - 3/17/2021
+
+divide: ; Divides both numbers        
+        push    R5 ; quotient
+        push    R6 ; remainder
+        push    R7 ; result value
+        push    R8 ; result variable
+
+        mov     num2, R5
+        mov     num1, R6
+        mov     #0, R7
+
+        cmp     #0, R5
+        jz      divideResult
+        cmp     #0, R6
+        jz      divideResult
+        cmp     R5, R6 ; num1 - num2
+        jn      divideResult
+
+;Objetivo: Restar los dos numeros hasta el resultado final.
+;Precondiciones: Tener dos numeros y querer seguir dividiendo.
+;Postcondiciones: El resultado es obtenido.
+;Autor: Yavier Mari
+;Fecha: 3/14/2021 - 3/17/2021
+
+divideHelper: ; Divide helper method, keeps subtracting
+        sub     R5, R6 ; num1 <- num1 - num2
+        inc     R7 ; increase result value
+        cmp     R5, R6
+        jge     divideHelper
+
+;Objetivo: Devolver el resultado de la division.
+;Precondiciones: Haber dividido dos numeros y tener el resultado.
+;Postcondiciones: El resultado es guardado en la variable "result".
+;Autor: Yavier Mari
+;Fecha: 3/14/2021 - 3/17/2021
+
+divideResult: ; Return the division result
+        mov     #result, R8
+        mov     R7, 2(R8)
+        
+        pop     R8
+        pop     R7
+        pop     R6
+        pop     R5
+
+        ret
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+EndProgram:
+        JMP $                           ; jump to current location '$'
+        NOP                             ; (endless loop)
+
+        END
+          
