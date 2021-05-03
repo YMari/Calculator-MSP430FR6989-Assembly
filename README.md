@@ -1,4 +1,4 @@
-# Calculator Application in Assembly for the Texas Instruments MSP430-FR6989 LaunchPad.
+# Calculator Application in Assembly for the Texas Instruments MSP430-FR6989 LaunchPad. (IAR IDE)
 
 ### Team Members: [Kevin Lugo](https://github.com/Kevin-Lugo), [José Maldonado](https://github.com/jose-maldonado)
 
